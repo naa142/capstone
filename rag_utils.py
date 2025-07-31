@@ -569,6 +569,90 @@ def perform_compliance_analysis(
     for c in similar_chunks[:MAX_REFERENCES]:
         truncated_chunk = c['chunk_text'][:MAX_REFERENCE_LENGTH]
         doc_type = c.get('document_type', 'N/A')
+        source = c.get('document_name', 'Unnamed Reference')
+        similar_blocks.append(
+            f"📄 {truncated_chunk}\n🔗 Source: {source} ({doc_type})"
+        )
+
+    # --- Persona + Task Description ---
+    persona_intro = {
+        "en": (
+            "You are a senior legal advisor and regulatory compliance expert specializing in Middle Eastern and Arab-region law. "
+            "Your job is to assess legal document sections for alignment with national laws using relevant legal references. "
+            "Respond as a professional consultant with precise legal analysis and direct recommendations."
+        ),
+        "ar": (
+            "أنت مستشار قانوني كبير وخبير امتثال متخصص في قوانين الدول العربية والشرق الأوسط. "
+            "مهمتك هي تقييم أقسام المستندات القانونية من حيث توافقها مع القوانين الوطنية بالاعتماد على النصوص القانونية المرجعية. "
+            "أجب كمستشار محترف مع تحليل قانوني دقيق وتوصيات مباشرة."
+        )
+    }
+
+    task_instructions = {
+        "en": (
+            "**Your task:** Carefully evaluate the following legal section. Cross-check it with the provided legal references.\n\n"
+            "**For each section, provide:**\n"
+            "1. **Compliance Status**: Choose one of [Compliant, Partially Compliant, Non-Compliant].\n"
+            "2. **Specific Legal Issues**: List all problematic or vague clauses and explain why they may violate legal norms.\n"
+            "3. **Detailed Legal Analysis**: Explain your judgment in legal terms.\n"
+            "4. **Actionable Recommendations**: Suggest clear, specific edits or improvements.\n\n"
+            "If the section consists purely of copied legal text, and no conflicting clauses are present, it should be marked Compliant."
+        ),
+        "ar": (
+            "**مهمتك:** قيّم هذا القسم القانوني بعناية. قارن مضمونه بالنصوص القانونية المرجعية المرفقة.\n\n"
+            "**لكل قسم، قدم ما يلي:**\n"
+            "1. **حالة التوافق**: اختر واحدة من [متوافق، متوافق جزئيًا، غير متوافق].\n"
+            "2. **المشاكل القانونية المحددة**: أذكر البنود أو العبارات التي قد تكون مخالفة أو غير واضحة مع توضيح السبب.\n"
+            "3. **تحليل قانوني مفصل**: قدم مبرراتك القانونية بشكل مهني.\n"
+            "4. **توصيات قابلة للتنفيذ**: اقترح تعديلات أو تحسينات محددة.\n\n"
+            "إذا كان القسم مجرد نص قانوني منقول دون تغيير أو تعارض، وبدون بنود مضافة، فيجب اعتباره متوافقًا."
+        )
+    }
+
+    prompt = "\n\n".join([
+        persona_intro.get(lang, persona_intro["en"]),
+        task_instructions.get(lang, task_instructions["en"]),
+        "\n📜 Section to Analyze:\n" + truncated_section,
+        "\n📚 Relevant Legal References:\n" + "\n\n---\n\n".join(similar_blocks)
+    ])
+
+    try:
+        token_estimate = len(prompt.split()) * 4 // 3
+        model = "gpt-4-1106-preview" if token_estimate > 3000 else "gpt-4"
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=2000
+        )
+        analysis = response.choices[0].message.content.strip()
+        result = analyze_compliance_status(analysis)
+        result["analysis"] = analysis
+
+        if "النصوص القانونية" in truncated_section and result["status"] == "Non-Compliant":
+            if not result["issues"]:
+                result["status"] = "Compliant"
+                result["analysis"] += "\n\nNote: Pure legal references are typically considered compliant unless explicit violations are present."
+
+        return result
+
+    except Exception as e:
+        return {
+            "status": "Error",
+            "analysis": f"⚠️ GPT Error: {str(e)}",
+            "issues": [],
+            "recommendations": []
+        }
+def perform_compliance_analysis(
+    text: str,
+    similar_chunks: List[Dict],
+    lang: str
+) -> Dict:
+    truncated_section = text[:MAX_SECTION_LENGTH]
+    similar_blocks = []
+    for c in similar_chunks[:MAX_REFERENCES]:
+        truncated_chunk = c['chunk_text'][:MAX_REFERENCE_LENGTH]
+        doc_type = c.get('document_type', 'N/A')
         similar_blocks.append(
             f"📄 {truncated_chunk}\n🔗 Source: {c['document_name']} ({doc_type})"
         )
