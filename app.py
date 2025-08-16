@@ -1,268 +1,261 @@
-# app.py
-
 import streamlit as st
+import tempfile
+import os
+import time
+import numpy as np
+from openai import OpenAI
+from dotenv import load_dotenv
+from typing import List, Dict
+
+# Load environment variables
+load_dotenv()
+
+# Validate required environment variables
+required_env_vars = ["OPENAI_API_KEY"]
+missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+if missing_vars:
+    st.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+    st.stop()
+
+# Initialize OpenAI client
+try:
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+except Exception as e:
+    st.error(f"OpenAI API initialization error: {e}")
+    client = None
+
 from rag_utils import (
     extract_text,
     detect_language,
-    detect_doc_type,
     detect_country,
+    detect_doc_type,
     chunk_legal_document_semantic,
     embed_text,
     retrieve_top_similar_chunks,
-    check_legal_compliance,
-    clean_section_title
+    clean_section_title,
+    cohere_client,
+    MAX_SECTION_LENGTH,
+    get_db_connection,
+    DB_EMBEDDING_DIM,
+    parse_compliance_response,
+    extract_article_number,
+    MAX_REFERENCE_LENGTH,
+    DocumentMetadata,
+    format_retrieved_chunk,
+    check_legal_compliance
 )
-import tempfile
-import os
-from typing import Dict, List, Optional, Union
-import json
-import re
 
-# Configure page
+
+# Streamlit UI Configuration
 st.set_page_config(
-    page_title="⚖️ Legal Compliance Analyzer",
+    page_title="⚖️ Legal Document Compliance Analyzer",
     page_icon="⚖️",
     layout="wide"
 )
 
-# Custom CSS with improved RTL support
-st.markdown("""
-<style>
-    .rtl-text {
-        text-align: right;
-        direction: rtl;
-        font-family: 'Arial', sans-serif;
-        white-space: pre-wrap;
-    }
-    .ltr-text {
-        text-align: left;
-        direction: ltr;
-        font-family: 'Arial', sans-serif;
-        white-space: pre-wrap;
-    }
-    .compliance-result {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-        border-left: 4px solid;
-    }
-    .compliant {
-        background-color: #e6f7e6;
-        border-color: #2e7d32;
-    }
-    .partially-compliant {
-        background-color: #fff8e1;
-        border-color: #ff8f00;
-    }
-    .non-compliant {
-        background-color: #ffebee;
-        border-color: #c62828;
-    }
-    .warning {
-        background-color: #fff3e0;
-        border-color: #ffa000;
-    }
-    .error {
-        background-color: #ffebee;
-        border-color: #d32f2f;
-    }
-    .reference-item {
-        margin-bottom: 1rem;
-        padding: 0.5rem;
-        background-color: #f5f5f5;
-        border-radius: 0.25rem;
-    }
-    .reference-title {
-        font-weight: bold;
-        margin-bottom: 0.5rem;
-    }
-    .section-content {
-        background-color: #f9f9f9;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-    }
-</style>
-""", unsafe_allow_html=True)
+# Debug mode
+DEBUG_MODE = st.sidebar.checkbox("Enable debug mode", False)
 
-class SessionState:
-    def __init__(self):
-        self.chunks = []
-        self.full_text = ""
-        self.full_report = ""
-        self.lang = "en"
-        self.country_code = "XX"
-        self.doc_type = "Unknown"
-        self.filename = ""
-        self.analysis_results = {}
-        self.last_error = ""
+# API Status Checks
+if cohere_client is None:
+    st.warning("⚠️ Cohere API not available - using fallback embeddings")
 
-    def reset(self):
-        self.__init__()
+if client is None:
+    st.error("❌ OpenAI API not available - compliance analysis will be limited")
 
-if "state" not in st.session_state:
-    st.session_state.state = SessionState()
-
-def save_uploaded_file(uploaded_file) -> Optional[str]:
+# Database validation
+if DEBUG_MODE:
     try:
-        file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-        if file_ext not in ['.pdf', '.docx', '.png', '.jpg', '.jpeg']:
-            st.session_state.state.last_error = f"Unsupported file extension: {file_ext}"
-            return None
-        with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as tmp_file:
-            tmp_file.write(uploaded_file.getbuffer())
-            return tmp_file.name
+        conn = get_db_connection()
+        if conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT vector_dims(metadata_node_embedding) FROM document_part_new_embedding LIMIT 1;")
+                db_dim = cur.fetchone()[0]
+                st.sidebar.markdown("### Database Info")
+                st.sidebar.write(f"📐 Database embedding dimension: {db_dim}")
+                st.sidebar.write(f"📐 Expected dimension: {DB_EMBEDDING_DIM}")
+                
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_docs,
+                        COUNT(DISTINCT(metadata->>'country')) as countries,
+                        COUNT(DISTINCT(metadata->>'doc_type')) as doc_types
+                    FROM document_new
+                """)
+                counts = cur.fetchone()
+                st.sidebar.write(f"📊 Documents: {counts[0]}")
+                st.sidebar.write(f"🌍 Countries: {counts[1]}")
+                st.sidebar.write(f"📝 Document types: {counts[2]}")
     except Exception as e:
-        st.session_state.state.last_error = f"File save error: {str(e)}"
-        return None
+        st.sidebar.error(f"Database check failed: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
-def process_document(uploaded_file):
-    st.session_state.state.reset()
-    with st.spinner("🔄 Saving uploaded file..."):
-        tmp_path = save_uploaded_file(uploaded_file)
-        if not tmp_path:
-            return False
-
-    with st.spinner("📄 Extracting document text..."):
-        try:
-            st.session_state.state.full_text = extract_text(tmp_path)
-            st.session_state.state.filename = uploaded_file.name
-        except Exception as e:
-            st.session_state.state.last_error = str(e)
-            return False
-        finally:
-            try: os.unlink(tmp_path)
-            except: pass
-
-    with st.spinner("🔍 Analyzing document properties..."):
-        try:
-            st.session_state.state.lang = detect_language(st.session_state.state.full_text)
-            st.session_state.state.country_code = detect_country(st.session_state.state.full_text)
-            st.session_state.state.doc_type = detect_doc_type(st.session_state.state.full_text)
-        except Exception as e:
-            st.session_state.state.last_error = f"Analysis error: {str(e)}"
-            return False
-
-    with st.spinner("✂️ Segmenting document..."):
-        try:
-            st.session_state.state.chunks = chunk_legal_document_semantic(st.session_state.state.full_text)
-            if not st.session_state.state.chunks:
-                st.session_state.state.last_error = "Document could not be segmented. Please check if the file contains real legal content."
-                return False
-        except Exception as e:
-            st.session_state.state.last_error = f"Chunking error: {str(e)}"
-            return False
-
-    return True
-
-def display_compliance_result(result: Dict[str, Union[str, List[str]]], lang: str = "en"):
-    status = result.get("status", "Non-Compliant")
-    status_config = {
-        "Compliant": {"icon": "✅", "class": "compliant"},
-        "Partially Compliant": {"icon": "⚠️", "class": "partially-compliant"},
-        "Non-Compliant": {"icon": "❌", "class": "non-compliant"},
-        "Error": {"icon": "❌", "class": "error"},
-    }
-    config = status_config.get(status, status_config["Non-Compliant"])
-    text_class = "rtl-text" if lang == "ar" else "ltr-text"
-    analysis_text = re.sub(r'<[^>]+>', '', result.get("analysis", ""))
-
-    st.markdown(f"""
-    <div class="compliance-result {config['class']}">
-        <h4>{config['icon']} {status}</h4>
-        <div class="{text_class}">{analysis_text}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    if result.get("issues"):
-        issues_title = "المشاكل الرئيسية" if lang == "ar" else "Key Issues"
-        st.markdown(f"**{issues_title}:**")
-        for issue in result["issues"]:
-            st.markdown(f"- {issue}")
-
-    if result.get("recommendations"):
-        rec_title = "التوصيات" if lang == "ar" else "Recommendations"
-        st.markdown(f"**{rec_title}:**")
-        for rec in result["recommendations"]:
-            st.markdown(f"- {rec}")
-
-# Main UI
 st.title("⚖️ Legal Document Compliance Analyzer")
-st.markdown("Upload legal documents to check compliance with relevant laws and regulations.")
+st.write("Upload legal documents to check compliance with relevant laws and regulations")
 
-uploaded_file = st.file_uploader("Upload legal document", type=["pdf", "docx", "png", "jpg", "jpeg"])
+# File uploader
+uploaded_file = st.file_uploader("📄 Upload legal document", type=["pdf", "docx", "png", "jpg", "jpeg"])
 
-if uploaded_file and st.button("Analyze Document", type="primary"):
-    if process_document(uploaded_file):
-        st.success("✅ Document processed successfully!")
+if uploaded_file:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
+        tmp.write(uploaded_file.read())
+        tmp_path = tmp.name
 
-        st.markdown(f"""
-        **File:** {st.session_state.state.filename}  
-        **Language:** {"Arabic" if st.session_state.state.lang == "ar" else "English"}  
-        **Jurisdiction:** {st.session_state.state.country_code}  
-        **Document Type:** {st.session_state.state.doc_type}  
-        **Sections:** {len(st.session_state.state.chunks)}  
-        """)
+    try:
+        with st.spinner("🔍 Analyzing document..."):
+            start_time = time.time()
+            
+            # Extract and analyze document
+            raw_text = extract_text(tmp_path)
+            language = detect_language(raw_text)
+            country = detect_country(raw_text)
+            doc_type = detect_doc_type(raw_text)
 
-        st.download_button(
-            "📥 Download Extracted Chunks (JSON)",
-            data=json.dumps(st.session_state.state.chunks, ensure_ascii=False, indent=2),
-            file_name="chunks.json",
-            mime="application/json"
-        )
-    else:
-        st.error(f"❌ Processing failed: {st.session_state.state.last_error}")
+            if DEBUG_MODE:
+                st.sidebar.markdown("### Document Info")
+                st.sidebar.metric("Text Length", f"{len(raw_text):,} chars")
+                st.sidebar.write(f"Language: {language}")
+                st.sidebar.write(f"Country: {country}")
+                st.sidebar.write(f"Type: {doc_type}")
 
-if st.session_state.state.chunks:
-    st.subheader("📑 Document Sections")
+            st.success("✅ Document loaded successfully")
+            st.markdown(f"**Language**: `{language}` | **Country**: `{country}` | **Type**: `{doc_type}`")
 
-    selected_index = st.selectbox(
-        "Select a section to analyze:",
-        options=[f"{i+1}. {clean_section_title(c['header'])}" for i, c in enumerate(st.session_state.state.chunks)],
-        index=0
-    ).split(".")[0]
-    selected_index = int(selected_index) - 1
-    selected_chunk = st.session_state.state.chunks[selected_index]
+            # Add metadata filters
+            st.sidebar.markdown("### 🔍 Metadata Filters")
+            topic_filter = st.sidebar.text_input("Filter by topic (optional)")
+            authority_filter = st.sidebar.text_input("Filter by authority (optional)")
 
-    with st.expander(f"🔍 View Section: {clean_section_title(selected_chunk['header'])}", expanded=True):
-        st.markdown(f"""
-        <div class="section-content {'rtl-text' if st.session_state.state.lang == 'ar' else 'ltr-text'}">
-            {selected_chunk["content"]}
-        </div>
-        """, unsafe_allow_html=True)
+            # Chunk the document
+            chunks = chunk_legal_document_semantic(raw_text)
 
-        if st.button("Check Compliance for This Section", key=f"check_{selected_index}"):
-            with st.spinner("⚖️ Analyzing compliance..."):
-                embedding = embed_text(selected_chunk["content"])
-                similar_chunks = retrieve_top_similar_chunks(
-                    embedding,
-                    st.session_state.state.country_code,
-                    st.session_state.state.doc_type
-                )
-                result = check_legal_compliance(
-                    selected_chunk["content"],
-                    similar_chunks,
-                    st.session_state.state.lang
-                )
-                st.session_state.state.analysis_results[selected_index] = {
-                    "result": result,
-                    "similar_chunks": similar_chunks
-                }
-            st.subheader("📋 Compliance Analysis")
-            display_compliance_result(result, st.session_state.state.lang)
+            if not chunks:
+                st.error("❌ No content found after chunking.")
+            else:
+                st.markdown("### 📑 Document Sections")
+                for idx, chunk in enumerate(chunks):
+                    with st.expander(f"📄 Section {idx + 1}: {clean_section_title(chunk['header'])}"):
+                        st.text_area("Content", chunk["content"], height=250, key=f"content_{idx}", label_visibility="collapsed")
 
-            with st.expander("🔎 View Retrieved Legal References"):
-                for chunk in similar_chunks:
-                    st.markdown(f"""
-                    <div class="reference-item">
-                        <div class="reference-title">{chunk['document_name']} ({chunk.get('document_type', 'N/A')})</div>
-                        <div class="reference-excerpt {'rtl-text' if st.session_state.state.lang == 'ar' else 'ltr-text'}">
-                            {chunk['chunk_text'][:500]}{'...' if len(chunk['chunk_text']) > 500 else ''}
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            if st.button("🔍 View Retrieved Chunks", key=f"preview_btn_{idx}"):
+                                with st.spinner("Finding similar legal references..."):
+                                    try:
+                                        embedding = embed_text(chunk["content"])
+                                        
+                                        if DEBUG_MODE:
+                                            st.sidebar.markdown("### Embedding Debug")
+                                            st.sidebar.write(f"Dimensions: {len(embedding)}")
+                                            st.sidebar.write(f"Sample values: {embedding[:5]}...")
 
-# Sidebar
-with st.sidebar:
-    st.markdown("### ℹ️ About")
-    st.markdown("Check legal documents for compliance with local regulations.")
+                                        similar_chunks = retrieve_top_similar_chunks(
+                                            embedding,
+                                            country_code=country,
+                                            doc_type=doc_type,
+                                            topic=topic_filter if topic_filter else None,
+                                            authority=authority_filter if authority_filter else None,
+                                            similarity_threshold=0.15,
+                                            debug=DEBUG_MODE
+                                        )
+
+                                        if similar_chunks:
+                                            st.markdown(f"#### Found {len(similar_chunks)} similar legal provisions:")
+                                            for i, ref in enumerate(similar_chunks):
+                                                formatted = format_retrieved_chunk(ref)
+                                                with st.expander(f"{i+1}. {formatted['display']['law_title']} (Similarity: {ref['similarity']:.2f})"):
+                                                    col_meta, col_content = st.columns([1, 3])
+                                                    with col_meta:
+                                                        st.markdown("**Metadata:**")
+                                                        st.markdown(f"- Authority: {formatted['display']['authority']}")
+                                                        if formatted['display'].get('country'):
+                                                            st.markdown(f"- Country: {formatted['display']['country']}")
+                                                        if formatted['display'].get('doc_type'):
+                                                            st.markdown(f"- Type: {formatted['display']['doc_type']}")
+                                                    with col_content:
+                                                        st.markdown("**Content:**")
+                                                        st.markdown(f"**Relevant Article:** {formatted['display']['article']}")
+                                                        st.text(formatted['formatted_content'])
+                                        else:
+                                            st.warning("No similar legal provisions found.")
+                                            
+                                    except Exception as e:
+                                        st.error(f"Error retrieving chunks: {str(e)}")
+                                        if DEBUG_MODE:
+                                            st.exception(e)
+
+                        with col2:
+                            if st.button("Check Compliance", key=f"btn_{idx}"):
+                                with st.spinner("⚖️ Analyzing compliance..."):
+                                    try:
+                                        embedding = embed_text(chunk["content"])
+                                        similar_chunks = retrieve_top_similar_chunks(
+                                            embedding,
+                                            country_code=country,
+                                            doc_type=doc_type,
+                                            topic=topic_filter if topic_filter else None,
+                                            authority=authority_filter if authority_filter else None,
+                                            similarity_threshold=0.15
+                                        )
+                                        
+                                        result = check_legal_compliance(
+                                            chunk["content"],
+                                            similar_chunks,
+                                            language
+                                        )
+                                        
+                                        # Display results
+                                        status_color = {
+                                            "Compliant": "green",
+                                            "Partially Compliant": "orange",
+                                            "Non-Compliant": "red",
+                                            "Error": "gray"
+                                        }.get(result["status"], "blue")
+                                        
+                                        st.markdown(f"### Compliance Status: :{status_color}[{result['status']}]")
+                                        
+                                        if result['references']:
+                                            with st.expander("📜 Referenced Legal Articles"):
+                                                for ref in result['references']:
+                                                    st.code(ref)
+                                        
+                                        with st.expander("📝 Full Analysis"):
+                                            st.markdown(result['analysis'])
+                                        
+                                        if result['issues']:
+                                            st.warning("#### 🚨 Potential Issues")
+                                            for issue in result['issues']:
+                                                st.write(f"- {issue}")
+                                        
+                                        if result['recommendations']:
+                                            st.info("#### 💡 Recommendations")
+                                            for rec in result['recommendations']:
+                                                st.write(f"- {rec}")
+                                                
+                                        if result['relevant_authorities']:
+                                            st.markdown("#### 🏛️ Relevant Authorities")
+                                            for auth in result['relevant_authorities']:
+                                                st.write(f"- {auth}")
+                                                
+                                        if result['related_topics']:
+                                            st.markdown("#### 🏷️ Related Topics")
+                                            for topic in result['related_topics']:
+                                                st.write(f"- {topic}")
+                                                
+                                    except Exception as e:
+                                        st.error(f"Compliance analysis failed: {str(e)}")
+                                        if DEBUG_MODE:
+                                            st.exception(e)
+
+    except Exception as e:
+        st.error(f"Document processing failed: {e}")
+        if DEBUG_MODE:
+            st.exception(e)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except:
+            pass
